@@ -1,0 +1,89 @@
+name: Build Android APK
+
+# Runs every time you upload/commit files to main, or manually from the Actions tab.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the repo files
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Prepare Android project
+        run: |
+          set -e
+          test -f android-project.zip || { echo "::error::android-project.zip is missing from the repo root"; exit 1; }
+          rm -rf build-android
+          mkdir build-android
+          unzip -q android-project.zip -d build-android
+          WWW=build-android/app/src/main/assets/www
+          mkdir -p "$WWW"
+          for f in index.html app.js styles.css manifest.json sw.js pdf-lib.min.js pdf.min.js pdf.worker.min.js icon-192.png icon-512.png apple-touch-icon.png; do
+            test -f "$f" || { echo "::error::$f is missing from the repo root"; exit 1; }
+            cp "$f" "$WWW/"
+          done
+          VERSION=$(grep -oP "APP_VERSION\s*=\s*'\K[^']+" app.js | head -1)
+          test -n "$VERSION" || { echo "::error::Could not read APP_VERSION from app.js"; exit 1; }
+          echo "VERSION_NAME=$VERSION" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=${{ github.run_number }}" >> "$GITHUB_ENV"
+          echo "Building version $VERSION (code ${{ github.run_number }})"
+
+      - name: Load signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::Secret KEYSTORE_BASE64 is not set. Add it under Settings > Secrets and variables > Actions (see README)."
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        working-directory: build-android
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Name the APK
+        run: cp build-android/app/build/outputs/apk/release/app-release.apk "Invoices-v${VERSION_NAME}.apk"
+
+      - name: Keep APK as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Invoices-APK
+          path: Invoices-v*.apk
+
+      - name: Publish GitHub Release (used by the app's Update button)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${VERSION_NAME}"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          sleep 3
+          gh release create "$TAG" "Invoices-v${VERSION_NAME}.apk" \
+            --target "$GITHUB_SHA" \
+            --title "Invoices $TAG" \
+            --notes "Android app v${VERSION_NAME} (build ${VERSION_CODE}). Download the .apk below on your phone and open it to install or update." \
+            --latest

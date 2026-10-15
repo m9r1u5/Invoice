@@ -3,7 +3,7 @@
    Invoices PWA — offline invoicing (IndexedDB + pdf-lib + pdf.js)
    To publish an update: bump APP_VERSION here AND VERSION in sw.js.
    ===================================================================== */
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 
 /* ---------------------------------------------------------------------
    CORE: pure logic (money, VAT, dates, numbering, PDF text extraction)
@@ -204,6 +204,9 @@ if (typeof window === 'undefined') { module.exports = Core; }
 else { window.Core = Core; boot(); }
 
 function boot() {
+/* Android app wrapper (APK) exposes window.AndroidApp; in a browser it's undefined */
+const NATIVE = window.AndroidApp || null;
+if (NATIVE) document.documentElement.classList.add('native-app');
 /* ---------------------------------------------------------------------
    DATABASE (IndexedDB)
    --------------------------------------------------------------------- */
@@ -355,6 +358,10 @@ function formData(root) {
   return o;
 }
 function downloadBlob(blob, name) {
+  if (NATIVE) {
+    blob.arrayBuffer().then((buf) => NATIVE.saveFile(bufToB64(buf), name, blob.type || 'application/octet-stream'));
+    return;
+  }
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = name; a.rel = 'noopener';
@@ -811,7 +818,7 @@ async function renderInvoiceView(id) {
 
   $('#aPrev').onclick = () => withPdf(inv, (bytes) => previewPdf(bytes, 'Invoice ' + inv.number));
   $('#aDown').onclick = () => withPdf(inv, (bytes, name) => { downloadBlob(new Blob([bytes], { type: 'application/pdf' }), name); toast('PDF downloaded'); });
-  $('#aPrint').onclick = () => withPdf(inv, (bytes) => printPdf(bytes));
+  $('#aPrint').onclick = () => withPdf(inv, (bytes, name) => printPdf(bytes, name));
   $('#aShare').onclick = () => withPdf(inv, (bytes, name) => sharePdf(bytes, name, inv));
   $$('[data-st]', view).forEach((b) => {
     b.onclick = async () => {
@@ -886,6 +893,7 @@ async function withPdf(inv, fn) {
   } finally { busy = false; }
 }
 async function sharePdf(bytes, name, inv) {
+  if (NATIVE) { NATIVE.shareFile(bufToB64(bytes), name, 'application/pdf'); return; }
   const file = new File([bytes], name, { type: 'application/pdf' });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
     try { await navigator.share({ files: [file], title: name }); }
@@ -930,7 +938,8 @@ async function previewPdf(bytes, title) {
   body.innerHTML = '<div class="pdf-pages"></div>';
   canvases.forEach((c) => $('.pdf-pages', body).appendChild(c));
 }
-async function printPdf(bytes) {
+async function printPdf(bytes, name) {
+  if (NATIVE) { NATIVE.printPdf(bufToB64(bytes), (name || 'Invoice').replace(/\.pdf$/i, '')); return; }
   toast('Preparing to print…');
   const canvases = await renderPdfPages(bytes, 2.2);
   const area = $('#printArea');
@@ -1316,7 +1325,7 @@ async function renderSettings() {
     </div>
     <h3>App</h3>
     <div class="card">
-      <dl class="kv" style="margin-top:0"><dt>Version</dt><dd>v${APP_VERSION}</dd><dt>Data stored</dt><dd>On this phone only</dd></dl>
+      <dl class="kv" style="margin-top:0"><dt>Version</dt><dd>v${APP_VERSION}</dd><dt>Data stored</dt><dd>On this phone only</dd>${NATIVE ? '<dt>Installed as</dt><dd>Android app</dd>' : ''}</dl>
       <div class="spacer"></div>
       <div class="btn-row"><button class="btn" id="sUpdate">Check for updates</button><button class="btn danger" id="sWipe">${ICON.trash} Erase all data</button></div>
     </div>`;
@@ -1424,6 +1433,13 @@ async function exportBackup() {
   const name = 'invoices-backup-' + Core.todayISO() + '.json';
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
   const file = new File([blob], name, { type: 'application/json' });
+  if (NATIVE) {
+    const choice = await dialog('Export backup', '<p>Save the backup to your Downloads folder, or share it (e.g. to Google Drive, email or WhatsApp yourself).</p>',
+      [{ label: 'Download', value: 'dl' }, { label: 'Share', value: 'share', cls: 'primary' }]);
+    const b64 = bufToB64(await blob.arrayBuffer());
+    if (choice === 'share') NATIVE.shareFile(b64, name, 'application/json'); else NATIVE.saveFile(b64, name, 'application/json');
+    return;
+  }
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
     const choice = await dialog('Export backup', '<p>Save the backup file to your phone, or share it (e.g. to Google Drive, email or WhatsApp yourself).</p>',
       [{ label: 'Download', value: 'dl' }, { label: 'Share', value: 'share', cls: 'primary' }]);
@@ -1461,7 +1477,7 @@ $('#pickBackup').addEventListener('change', async (e) => {
 let deferredPrompt = null, installedFlag = false;
 const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
-function updateInstallBtn() { $('#btnInstall').hidden = isStandalone() || installedFlag; }
+function updateInstallBtn() { $('#btnInstall').hidden = !!NATIVE || isStandalone() || installedFlag; }
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredPrompt = e; updateInstallBtn(); });
 window.addEventListener('appinstalled', () => { deferredPrompt = null; installedFlag = true; updateInstallBtn(); toast('App installed'); });
 $('#btnInstall').onclick = async () => {
@@ -1483,6 +1499,13 @@ $('#btnInstall').onclick = async () => {
   }
 };
 $('#btnShareApp').onclick = async () => {
+  if (NATIVE) {
+    const repo = NATIVE.repo();
+    if (!repo) { toast('App link not available in this build'); return; }
+    const [owner, name] = repo.split('/');
+    NATIVE.shareText('Invoices app\n\nAndroid (APK): https://github.com/' + repo + '/releases/latest\n\niPhone / browser: https://' + owner.toLowerCase() + '.github.io/' + name + '/');
+    return;
+  }
   const url = location.href.split('#')[0].replace(/index\.html$/, '');
   if (navigator.share) {
     try { await navigator.share({ title: 'Invoices app', text: 'Offline invoicing app — open the link and tap Install.', url }); return; }
@@ -1493,7 +1516,7 @@ $('#btnShareApp').onclick = async () => {
 };
 
 let swReg = null, updating = false;
-if ('serviceWorker' in navigator) {
+if (!NATIVE && 'serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then((reg) => {
     swReg = reg;
     if (reg.waiting && navigator.serviceWorker.controller) toast('An update is ready — tap Update', 4000);
@@ -1507,7 +1530,37 @@ if ('serviceWorker' in navigator) {
   }).catch((e) => console.warn('SW registration failed', e));
   navigator.serviceWorker.addEventListener('controllerchange', () => { if (updating) location.reload(); });
 }
+function cmpVer(a, b) {
+  const pa = String(a).replace(/^v/i, '').split('.').map((x) => parseInt(x, 10) || 0);
+  const pb = String(b).replace(/^v/i, '').split('.').map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d > 0 ? 1 : -1; }
+  return 0;
+}
+async function checkNativeUpdate() {
+  const repo = NATIVE.repo();
+  if (!repo) { toast('Update checks are not set up in this build'); return; }
+  if (!navigator.onLine) { toast("You're offline — connect to check for updates"); return; }
+  toast('Checking for updates…', 10000);
+  let rel;
+  try {
+    const r = await fetch('https://api.github.com/repos/' + repo + '/releases/latest', { cache: 'no-store', headers: { Accept: 'application/vnd.github+json' } });
+    if (r.status === 404 || r.status === 403) {
+      // private repo (or rate limited): let the user check the releases page while signed in to GitHub
+      const go = await confirmBox('Check for updates', `You have v${esc(APP_VERSION)}. Open the GitHub releases page to see if a newer version is available?<br><br>If there is, download the .apk, open it and tap <b>Update</b>. Your data is kept.`, 'Open');
+      if (go) NATIVE.openUrl('https://github.com/' + repo + '/releases/latest');
+      return;
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    rel = await r.json();
+  } catch (e) { toast("Couldn't reach GitHub to check for updates"); return; }
+  const latest = String(rel.tag_name || '').replace(/^v/i, '');
+  if (!latest || cmpVer(latest, APP_VERSION) <= 0) { toast(`You're on the latest version (v${APP_VERSION})`); return; }
+  const apk = (rel.assets || []).find((a) => /\.apk$/i.test(a.name));
+  const ok = await confirmBox('Update available', `Version <b>v${esc(latest)}</b> is available (you have v${esc(APP_VERSION)}).<br><br>Tap Download, then open the downloaded file and tap <b>Update</b>. Your invoices and settings are kept.`, 'Download');
+  if (ok) NATIVE.openUrl(apk ? apk.browser_download_url : rel.html_url);
+}
 async function checkForUpdate() {
+  if (NATIVE) return checkNativeUpdate();
   if (!swReg) { toast('Updates need the app to be opened from its web link once'); return; }
   if (!navigator.onLine) { toast("You're offline — connect to check for updates"); return; }
   toast('Checking for updates…', 10000);
