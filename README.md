@@ -73,6 +73,20 @@ The same repo also builds a real Android app (APK). GitHub does the building —
 Settings → company details, logo, banking details, VAT (on/off, 15%), currency (R), payment terms,
 prefix (e.g. `INV-`) and **Last invoice number used** (e.g. 1047 → next invoice is INV-1048).
 
+## Quotes (v1.1.0)
+
+- **Settings → Quotes:** quote prefix (default `QUO-`), **Last quote number used** (separate from invoices),
+  days a quote is valid (default 30), default exclusions and default Terms & Conditions.
+- **New quote** (Home or Quotes tab): customer, title, scope of work, items in **sections** (Tanks, Piping, Labour…)
+  with section subtotals, **Optional** items (on the PDF, not in the total), VAT, and an optional **deposit**
+  (% of the subtotal, or a fixed amount excl. VAT; shown incl. VAT on the PDF).
+- **Statuses:** Draft → Sent (on Finalise) → Accepted / Declined. A sent quote past its valid-until date shows **Expired**.
+- **Duplicate** gives a new quote number. **New revision** makes `QUO-1050 Rev 1` (then Rev 2…) and keeps the original.
+- **Convert to invoice** (accepted quotes): deposit only, full amount (tick any optional items to include), or the balance
+  after a deposit invoice. It creates a draft invoice with the next invoice number and the quote number as reference;
+  quote and invoice link to each other.
+- Backups include quotes and quote settings. Older backups still restore.
+
 ## Good to know
 
 - **Backup often** (Settings → Export backup) and keep the file off the phone – clearing browser data or uninstalling deletes the invoices.

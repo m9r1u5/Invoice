@@ -1,6 +1,6 @@
 // Service worker: caches the whole app so it runs 100% offline.
 // To publish an update: change VERSION here AND APP_VERSION in app.js to the same value.
-const VERSION = '1.0.1';
+const VERSION = '1.1.0';
 const CACHE = 'invoice-app-' + VERSION;
 const ASSETS = [
   './',

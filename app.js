@@ -3,7 +3,7 @@
    Invoices PWA — offline invoicing (IndexedDB + pdf-lib + pdf.js)
    To publish an update: bump APP_VERSION here AND VERSION in sw.js.
    ===================================================================== */
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.1.0';
 
 /* ---------------------------------------------------------------------
    CORE: pure logic (money, VAT, dates, numbering, PDF text extraction)
@@ -93,6 +93,90 @@ const Core = {
   isDuplicate(number, invoices, exceptId) {
     const n = Core.norm(number);
     return (invoices || []).some((i) => i.id !== exceptId && Core.norm(i.number) === n);
+  },
+
+  /* ---------------- QUOTES ---------------- */
+  /** Quote numbering settings in the same shape nextNumber/bumpLast use. */
+  quoteNumbering(settings) {
+    return {
+      prefix: settings.quotePrefix == null ? 'QUO-' : settings.quotePrefix,
+      lastNumber: settings.quoteLastNumber == null ? '0' : settings.quoteLastNumber
+    };
+  },
+  /** Next free quote number (separate sequence from invoices). Revisions reserve their base number too. */
+  nextQuoteNumber(settings, quotes) {
+    const taken = [];
+    (quotes || []).forEach((q) => { taken.push({ number: q.number }); if (q.baseNumber) taken.push({ number: q.baseNumber }); });
+    return Core.nextNumber(Core.quoteNumbering(settings), taken);
+  },
+  bumpQuoteLast(settings, number) {
+    const n = Core.quoteNumbering(settings);
+    if (Core.bumpLast(n, number)) { settings.quoteLastNumber = n.lastNumber; return true; }
+    return false;
+  },
+  /** "QUO-1050" -> next revision "QUO-1050 Rev 1", "Rev 2", ... keeping every earlier version. */
+  nextRevision(baseNumber, quotes) {
+    const b = Core.norm(baseNumber);
+    let max = 0;
+    (quotes || []).forEach((q) => { if (Core.norm(q.baseNumber || q.number) === b) max = Math.max(max, q.rev || 0); });
+    return { number: baseNumber + ' Rev ' + (max + 1), rev: max + 1 };
+  },
+  /** Deposit (deposit.value: % for 'percent', cents excl. VAT for 'fixed') worked out on the quote subtotal. */
+  depositAmounts(subtotal, vatOn, rate, deposit) {
+    const type = deposit && deposit.type, v = Core.num(deposit && deposit.value);
+    let excl = 0;
+    if (type === 'percent' && v > 0) excl = Math.round(subtotal * Math.min(100, v) / 100 + 1e-7);
+    else if (type === 'fixed' && v > 0) excl = Math.min(Math.max(0, subtotal), Math.round(v));
+    const vat = vatOn ? Math.round(excl * Core.num(rate) / 100 + 1e-7) : 0;
+    return { excl, vat, total: excl + vat };
+  },
+  /** Quote rows = lines and {type:'section'} headers. Optional lines are shown but not added to totals. */
+  quoteTotals(rows, vatOn, rate, deposit) {
+    const lines = (rows || []).filter((r) => r.type !== 'section');
+    const t = Core.totals(lines.filter((l) => !l.optional), vatOn, rate);
+    t.optional = lines.filter((l) => l.optional).reduce((a, l) => a + Core.lineTotal(l), 0);
+    t.deposit = Core.depositAmounts(t.subtotal, vatOn, rate, deposit);
+    return t;
+  },
+  /** Group rows under their section headers; lines before the first header form an untitled group. */
+  sectionGroups(rows) {
+    const groups = [];
+    let cur = null;
+    (rows || []).forEach((r) => {
+      if (r.type === 'section') { cur = { id: r.id, title: r.title || '', lines: [] }; groups.push(cur); return; }
+      if (!cur) { cur = { id: null, title: '', lines: [] }; groups.push(cur); }
+      cur.lines.push(r);
+    });
+    groups.forEach((g) => {
+      g.subtotal = g.lines.filter((l) => !l.optional).reduce((a, l) => a + Core.lineTotal(l), 0);
+      g.optional = g.lines.filter((l) => l.optional).reduce((a, l) => a + Core.lineTotal(l), 0);
+    });
+    return groups;
+  },
+  /** draft | sent | accepted | declined | expired (expired = past valid-until and not accepted/declined) */
+  quoteStatus(q, today) {
+    if (q.state === 'draft') return 'draft';
+    if (q.status === 'accepted' || q.status === 'declined') return q.status;
+    if (q.validUntil && q.validUntil < (today || Core.todayISO())) return 'expired';
+    return 'sent';
+  },
+  /**
+   * Invoice lines for a quote. kind: 'full' | 'deposit' | 'balance'.
+   * includeOptional: ids of optional lines to include; deposits: [{number, excl}] already invoiced (for 'balance').
+   */
+  quoteToInvoiceLines(q, kind, includeOptional, deposits) {
+    const inc = new Set(includeOptional || []);
+    const t = Core.quoteTotals(q.lines, q.vatOn, q.vatRate, q.deposit);
+    if (kind === 'deposit') {
+      const pct = q.deposit && q.deposit.type === 'percent' ? ' (' + Core.qtyText(q.deposit.value) + '%)' : '';
+      return [{ code: '', desc: 'Deposit' + pct + ' as per quotation ' + q.number, note: q.title || '', unit: 'each', qty: 1, price: t.deposit.excl, disc: 0 }];
+    }
+    const out = (q.lines || []).filter((r) => r.type !== 'section' && (!r.optional || inc.has(r.id)))
+      .map((l) => ({ itemId: l.itemId || null, code: l.code || '', desc: l.desc || '', note: l.note || '', unit: l.unit || 'each', qty: l.qty, price: l.price, disc: l.disc || 0 }));
+    if (kind === 'balance') {
+      (deposits || []).forEach((d) => out.push({ code: '', desc: 'Less: deposit invoiced on ' + d.number, note: '', unit: 'each', qty: 1, price: -Math.abs(d.excl), disc: 0 }));
+    }
+    return out;
   },
   /** Find the first date anywhere in a string. Day-first for numeric dates (SA style). */
   parseDateLoose(s) {
@@ -210,19 +294,27 @@ if (NATIVE) document.documentElement.classList.add('native-app');
 /* ---------------------------------------------------------------------
    DATABASE (IndexedDB)
    --------------------------------------------------------------------- */
-const STORES = ['settings', 'customers', 'items', 'invoices', 'files'];
+const STORES = ['settings', 'customers', 'items', 'invoices', 'files', 'quotes'];
 const DB = {
   db: null,
   open() {
     if (this.db) return Promise.resolve(this.db);
     return new Promise((res, rej) => {
-      const r = indexedDB.open('invoice-app', 1);
+      // v1: settings, customers, items, invoices, files. v2 (app 1.1.0): + quotes.
+      // Upgrades only ADD missing stores — existing data is never touched.
+      const r = indexedDB.open('invoice-app', 2);
       r.onupgradeneeded = () => {
         const db = r.result;
         if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings', { keyPath: 'key' });
-        for (const s of ['customers', 'items', 'invoices', 'files']) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: 'id' });
+        for (const s of ['customers', 'items', 'invoices', 'files', 'quotes']) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: 'id' });
       };
-      r.onsuccess = () => { this.db = r.result; res(this.db); };
+      r.onblocked = () => { try { toast('Please close other open copies of this app to finish updating', 6000); } catch (e) { /* ignore */ } };
+      r.onsuccess = () => {
+        this.db = r.result;
+        // another tab/version wants to upgrade: let it, then reload into the new version
+        this.db.onversionchange = () => { this.db.close(); this.db = null; location.reload(); };
+        res(this.db);
+      };
       r.onerror = () => rej(r.error);
     });
   },
@@ -253,7 +345,14 @@ const DEFAULT_SETTINGS = {
   bank: { name: '', holder: '', account: '', branch: '', type: '', reference: '' },
   vatEnabled: true, vatRate: 15, currency: 'R', terms: 30,
   notes: '', footer: 'Thank you for your business.',
-  prefix: 'INV-', lastNumber: '0', theme: 'auto'
+  prefix: 'INV-', lastNumber: '0', theme: 'auto',
+  quotePrefix: 'QUO-', quoteLastNumber: '0', quoteValidDays: 30,
+  quoteTerms: '1. This quotation is valid until the date shown above.\n' +
+    '2. The deposit shown (if any) is payable on acceptance, before work or ordering starts.\n' +
+    '3. The balance is payable as per the agreed payment terms.\n' +
+    '4. Work or materials outside the scope above will be quoted separately.\n' +
+    '5. Prices are subject to change if the scope or quantities change.',
+  quoteExclusions: ''
 };
 let S = null; // settings cache
 
@@ -404,12 +503,15 @@ const view = $('#view');
 async function route() {
   const h = location.hash.replace(/^#/, '') || 'home';
   const [name, arg] = h.split('/');
-  const tab = { home: 'home', invoices: 'invoices', view: 'invoices', edit: 'invoices', customers: 'customers', items: 'items', settings: 'settings' }[name] || 'home';
+  const tab = { home: 'home', quotes: 'quotes', qview: 'quotes', qedit: 'quotes', invoices: 'invoices', view: 'invoices', edit: 'invoices', customers: 'customers', items: 'items', settings: 'settings' }[name] || 'home';
   $$('.bottomnav a').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab));
   if (!$('#sheet').hidden) closeSheet();
   window.scrollTo(0, 0);
   try {
-    if (name === 'invoices') await renderInvoices();
+    if (name === 'quotes') await renderQuotes();
+    else if (name === 'qedit') await renderQuoteEditor(arg);
+    else if (name === 'qview') await renderQuoteView(arg);
+    else if (name === 'invoices') await renderInvoices();
     else if (name === 'customers') await renderCustomers();
     else if (name === 'items') await renderItems();
     else if (name === 'settings') await renderSettings();
@@ -428,6 +530,8 @@ window.addEventListener('hashchange', route);
    --------------------------------------------------------------------- */
 async function renderHome() {
   const invs = sortInvoices(await DB.all('invoices'));
+  const quotes = sortQuotes(await DB.all('quotes'));
+  const openQuotes = quotes.filter((q) => quoteStatusOf(q) === 'sent');
   const month = Core.todayISO().slice(0, 7);
   let outstanding = 0, overdue = 0, paidMonth = 0;
   invs.forEach((i) => {
@@ -439,7 +543,7 @@ async function renderHome() {
   const setup = !S.company.name;
   view.innerHTML = `
     ${setup ? `<div class="notice"><b>Welcome!</b> Start by adding your company, logo and banking details.<div class="spacer"></div><a class="btn primary block" href="#settings">Open Settings</a></div>` : ''}
-    <button class="btn primary big block" id="hNew">${ICON.plus} New invoice</button>
+    <div class="btn-row home-new"><button class="btn primary big" id="hNew">${ICON.plus} New invoice</button><button class="btn big" id="hNewQ">${ICON.plus} New quote</button></div>
     <div class="spacer"></div>
     <div class="stats">
       <div class="stat"><span>Outstanding</span><b>${money(outstanding)}</b></div>
@@ -449,10 +553,15 @@ async function renderHome() {
     <button class="btn block" id="hImport">${ICON.upload} Import old PDF invoices</button>
     <h3>Recent invoices</h3>
     <div class="list">${invs.slice(0, 6).map(invoiceRow).join('') || '<div class="empty">No invoices yet.</div>'}</div>
-    ${invs.length > 6 ? '<div class="spacer"></div><a class="btn block" href="#invoices">See all invoices</a>' : ''}`;
+    ${invs.length > 6 ? '<div class="spacer"></div><a class="btn block" href="#invoices">See all invoices</a>' : ''}
+    ${quotes.length ? `<h3>Recent quotes${openQuotes.length ? ` · ${openQuotes.length} awaiting reply` : ''}</h3>
+    <div class="list">${quotes.slice(0, 3).map(quoteRow).join('')}</div>
+    ${quotes.length > 3 ? '<div class="spacer"></div><a class="btn block" href="#quotes">See all quotes</a>' : ''}` : ''}`;
   $('#hNew').onclick = () => { location.hash = '#edit/new'; };
+  $('#hNewQ').onclick = () => { location.hash = '#qedit/new'; };
   $('#hImport').onclick = () => $('#pickPdf').click();
   bindOpen(view);
+  bindOpenQuote(view);
 }
 
 /* ---------------------------------------------------------------------
@@ -796,6 +905,7 @@ async function renderInvoiceView(id) {
         <dt>Issued</dt><dd>${esc(Core.fmtDate(inv.date))}</dd>
         ${inv.due && !imported ? `<dt>Due</dt><dd>${esc(Core.fmtDate(inv.due))}</dd>` : ''}
         ${inv.po ? `<dt>PO number</dt><dd>${esc(inv.po)}</dd>` : ''}
+        ${inv.quoteNumber ? `<dt>From quote</dt><dd>${inv.quoteId ? `<a href="#qview/${esc(inv.quoteId)}">${esc(inv.quoteNumber)}</a>` : esc(inv.quoteNumber)}${inv.quoteKind === 'deposit' ? ' (deposit)' : inv.quoteKind === 'balance' ? ' (balance)' : ''}</dd>` : ''}
         ${!imported && inv.lines ? `<dt>Items</dt><dd>${inv.lines.length}</dd>` : ''}
         ${imported ? `<dt>File</dt><dd>${esc(inv.fileName || 'PDF')}</dd>` : ''}
       </dl>
@@ -845,6 +955,10 @@ async function renderInvoiceView(id) {
     if (!(await confirmBox('Delete invoice?', `Delete invoice <b>${esc(inv.number)}</b>? This cannot be undone.${extra}`, 'Delete', true))) return;
     await DB.del('invoices', inv.id);
     if (inv.fileId) await DB.del('files', inv.fileId);
+    if (inv.quoteId) {
+      const q = await DB.get('quotes', inv.quoteId);
+      if (q && q.invoiceIds) { q.invoiceIds = q.invoiceIds.filter((x) => x !== inv.id); await DB.put('quotes', q); }
+    }
     toast('Invoice deleted');
     location.replace('#invoices');
   };
@@ -867,6 +981,449 @@ function importedDetailsForm(inv) {
     await DB.put('invoices', inv);
     closeSheet(); toast('Saved');
     renderInvoiceView(inv.id);
+  };
+}
+
+/* ---------------------------------------------------------------------
+   QUOTES
+   --------------------------------------------------------------------- */
+const QSTATUS_LABEL = { draft: 'Draft', sent: 'Sent', accepted: 'Accepted', declined: 'Declined', expired: 'Expired' };
+function quoteStatusOf(q) { return Core.quoteStatus(q); }
+function quoteBadge(q) { const st = quoteStatusOf(q); return `<span class="badge q-${st}">${QSTATUS_LABEL[st]}</span>`; }
+function sortQuotes(list) {
+  return list.sort((a, b) => (b.date || '').localeCompare(a.date || '') ||
+    ((Core.trailingInt(b.baseNumber || b.number) || 0) - (Core.trailingInt(a.baseNumber || a.number) || 0)) ||
+    ((b.rev || 0) - (a.rev || 0)) || ((b.createdAt || 0) - (a.createdAt || 0)));
+}
+function quoteRow(q) {
+  return `<button class="list-item" data-qopen="${q.id}">
+    <div class="main"><div class="t">${esc(q.number)} · ${esc((q.customer && q.customer.name) || 'No customer')}</div>
+    <div class="s">${q.title ? esc(q.title) + ' · ' : ''}${esc(Core.fmtDate(q.date))} ${quoteBadge(q)}</div></div>
+    <div class="amt">${money(q.total || 0, q.currency)}</div></button>`;
+}
+function bindOpenQuote(root) { $$('[data-qopen]', root).forEach((b) => { b.onclick = () => { location.hash = '#qview/' + b.dataset.qopen; }; }); }
+
+/* ---------- list ---------- */
+let qFilter = 'all', qQuery = '';
+async function renderQuotes() {
+  const all = sortQuotes(await DB.all('quotes'));
+  view.innerHTML = `
+    <div class="title-row"><h1>Quotes</h1><button class="btn primary sm" id="qNew">${ICON.plus} New</button></div>
+    <div class="search">${ICON.search}<input type="search" id="qq" placeholder="Search number, customer, title or status" value="${esc(qQuery)}"></div>
+    <div class="chips">${['all', 'draft', 'sent', 'accepted', 'declined', 'expired'].map((f) => `<button class="chip ${f === qFilter ? 'on' : ''}" data-f="${f}">${f === 'all' ? 'All' : QSTATUS_LABEL[f]}</button>`).join('')}</div>
+    <div class="list" id="qList"></div>`;
+  const draw = () => {
+    const q = Core.norm(qQuery);
+    const list = all.filter((x) => {
+      const st = quoteStatusOf(x);
+      if (qFilter !== 'all' && st !== qFilter) return false;
+      if (!q) return true;
+      const d = x.date || '';
+      const hay = [x.number, x.customer && x.customer.name, x.title, QSTATUS_LABEL[st], d, Core.fmtDate(d), d.split('-').reverse().join('/')].join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+    $('#qList').innerHTML = list.map(quoteRow).join('') || `<div class="empty">${all.length ? 'No quotes found.' : 'No quotes yet. Tap New to create one.'}</div>`;
+    bindOpenQuote($('#qList'));
+  };
+  draw();
+  $('#qq').oninput = (e) => { qQuery = e.target.value; draw(); };
+  $$('.chip', view).forEach((c) => { c.onclick = () => { qFilter = c.dataset.f; $$('.chip', view).forEach((x) => x.classList.toggle('on', x === c)); draw(); }; });
+  $('#qNew').onclick = () => { location.hash = '#qedit/new'; };
+}
+
+/* ---------- editor ---------- */
+let qed = null; // quote being edited
+function newQuote(quotes) {
+  const date = Core.todayISO();
+  return {
+    id: uid(), number: Core.nextQuoteNumber(S, quotes), baseNumber: null, rev: 0, revOf: null,
+    state: 'draft', status: 'sent', date, validUntil: Core.addDays(date, S.quoteValidDays),
+    customerId: null, customer: null, title: '', scope: '', lines: [],
+    vatOn: !!S.vatEnabled, vatRate: Core.num(S.vatRate), currency: S.currency,
+    deposit: { type: 'none', value: 0 }, exclusions: S.quoteExclusions || '', terms: S.quoteTerms || '',
+    invoiceIds: [], createdAt: Date.now()
+  };
+}
+async function renderQuoteEditor(id) {
+  const quotes = await DB.all('quotes');
+  let isNew = false;
+  if (id === 'new' || !id) {
+    isNew = true;
+    qed = newQuote(quotes);
+    const pre = sessionStorage.getItem('dupQuote');
+    if (pre) { sessionStorage.removeItem('dupQuote'); try { Object.assign(qed, JSON.parse(pre)); } catch (e) { /* ignore */ } }
+  } else {
+    const q = quotes.find((x) => x.id === id);
+    if (!q) { view.innerHTML = '<div class="empty">Quote not found.</div>'; return; }
+    qed = JSON.parse(JSON.stringify(q));
+  }
+  qed.deposit = qed.deposit || { type: 'none', value: 0 };
+  qed._validTouched = !isNew;
+  const final = qed.state === 'final';
+  const lockNo = final || qed.rev > 0;
+  const dep = qed.deposit;
+  view.innerHTML = `
+    <div class="title-row"><h1>${isNew ? 'New quote' : (final ? 'Edit ' : 'Edit draft ') + esc(qed.number)}</h1></div>
+    <div class="card">
+      ${field('Quote number', 'number', qed.number, 'text', lockNo ? 'readonly' : '')}
+      ${lockNo ? `<p class="muted small" style="margin-top:-6px">${qed.rev > 0 ? 'Revision of ' + esc(qed.baseNumber) + '.' : 'Finalised quotes keep their number. Use New revision to change a sent quote.'}</p>` : ''}
+      <div class="grid2">${field('Quote date', 'date', qed.date, 'date')}${field('Valid until', 'validUntil', qed.validUntil, 'date')}</div>
+    </div>
+    <div class="card">
+      <label class="field"><span>Customer</span></label>
+      <button class="picker-btn" id="pickCust"><span id="custLabel"></span>${ICON.chev}</button>
+    </div>
+    <div class="card">
+      ${field('Project / quote title', 'title', qed.title, 'text', 'placeholder="e.g. New oil blending plant"')}
+      ${field('Scope of work', 'scope', qed.scope, 'textarea', 'rows="4"')}
+    </div>
+    <h3>Items</h3>
+    <p class="muted small" style="margin-top:-4px">Add a section (e.g. Tanks, Piping, Labour), then its items. Items go at the bottom; use the arrows to move them.</p>
+    <div id="qlines"></div>
+    <div class="grid3 add-row">
+      <button class="btn" id="addItem">${ICON.plus} Equipment</button>
+      <button class="btn" id="addLine">${ICON.plus} Once-off</button>
+      <button class="btn" id="addSection">${ICON.plus} Section</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="card">
+      <label class="check"><input type="checkbox" id="vatOn" ${qed.vatOn ? 'checked' : ''}> Charge VAT (${esc(Core.num(qed.vatRate))}%)</label>
+      <div class="grid2">
+        <label class="field"><span>Deposit required</span><select id="depType">
+          <option value="none" ${dep.type === 'none' ? 'selected' : ''}>No deposit</option>
+          <option value="percent" ${dep.type === 'percent' ? 'selected' : ''}>Percentage</option>
+          <option value="fixed" ${dep.type === 'fixed' ? 'selected' : ''}>Fixed amount</option>
+        </select></label>
+        <label class="field" id="depValWrap"><span id="depValLabel"></span><input type="text" inputmode="decimal" id="depVal"></label>
+      </div>
+    </div>
+    <div class="card">
+      ${field('Exclusions', 'exclusions', qed.exclusions, 'textarea', 'placeholder="e.g. Civil works, permits, electrical supply to site"')}
+      ${field('Terms & Conditions', 'terms', qed.terms, 'textarea', 'rows="6"')}
+    </div>
+    <div class="card totals" id="qtotals"></div>
+    <div class="sticky-actions">
+      ${final ? '<button class="btn primary" id="saveFinal">Save changes</button>' : '<button class="btn" id="saveDraft">Save draft</button><button class="btn primary" id="saveFinal">Finalise</button>'}
+    </div>`;
+
+  const setCust = () => {
+    $('#custLabel').innerHTML = qed.customer ? `<b>${esc(qed.customer.name)}</b><br><span class="muted small">${esc([qed.customer.phone, qed.customer.email].filter(Boolean).join(' · '))}</span>` : '<span class="muted">Select customer</span>';
+  };
+  setCust();
+  const setDep = () => {
+    const t = qed.deposit.type;
+    $('#depValWrap').hidden = t === 'none';
+    $('#depValLabel').textContent = t === 'percent' ? 'Deposit %' : 'Amount excl. VAT (' + S.currency + ')';
+    $('#depVal').value = t === 'percent' ? (qed.deposit.value ? Core.qtyText(qed.deposit.value) : '') : (qed.deposit.value ? (qed.deposit.value / 100).toFixed(2) : '');
+  };
+  setDep();
+
+  $$('input[name=number],input[name=date],input[name=validUntil],input[name=title],textarea[name=scope],textarea[name=exclusions],textarea[name=terms]', view).forEach((el) => {
+    el.addEventListener('input', () => {
+      qed[el.name] = el.value;
+      if (el.name === 'validUntil') qed._validTouched = true;
+      if (el.name === 'date' && !qed._validTouched && el.value) { qed.validUntil = Core.addDays(el.value, S.quoteValidDays); $('input[name=validUntil]').value = qed.validUntil; }
+    });
+  });
+  $('#vatOn').onchange = (e) => { qed.vatOn = e.target.checked; drawQTotals(); };
+  $('#depType').onchange = (e) => { qed.deposit = { type: e.target.value, value: 0 }; setDep(); drawQTotals(); };
+  $('#depVal').addEventListener('input', (e) => {
+    const v = e.target.value;
+    qed.deposit.value = qed.deposit.type === 'percent' ? Math.min(100, Math.max(0, Core.num(v))) : Math.max(0, Core.toCents(v));
+    drawQTotals();
+  });
+  $('#pickCust').onclick = () => pickCustomer((c) => {
+    qed.customerId = c.id;
+    qed.customer = { name: c.name, contact: c.contact, phone: c.phone, email: c.email, address: c.address, vatNo: c.vatNo };
+    setCust();
+  });
+  $('#addLine').onclick = () => { qed.lines.push(newLine({ optional: false })); drawQLines('last'); };
+  $('#addSection').onclick = () => { qed.lines.push({ id: uid(), type: 'section', title: '' }); drawQLines('last'); };
+  $('#addItem').onclick = () => pickItem((it) => {
+    qed.lines.push(newLine({ itemId: it.id, code: it.code, desc: it.description, note: it.notes || '', unit: it.unit, price: it.price, optional: false }));
+    drawQLines(false);
+  });
+  $('#saveFinal').onclick = () => saveQuote(true);
+  if (!final) $('#saveDraft').onclick = () => saveQuote(false);
+  drawQLines(false);
+}
+function drawQLines(focus) {
+  const box = $('#qlines');
+  if (!qed.lines.length) { box.innerHTML = '<div class="empty" style="padding:14px">No items yet. Add a section, equipment or a once-off line.</div>'; drawQTotals(); return; }
+  let n = 0;
+  const moveBtns = (i) => `<span class="row-tools">
+      <button class="icon-btn" data-up="${i}" aria-label="Move up" ${i === 0 ? 'disabled' : ''}><svg viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></svg></button>
+      <button class="icon-btn" data-down="${i}" aria-label="Move down" ${i === qed.lines.length - 1 ? 'disabled' : ''}><svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg></button>
+      <button class="icon-btn" data-del="${i}" aria-label="Remove">${ICON.trash}</button></span>`;
+  box.innerHTML = qed.lines.map((l, i) => {
+    if (l.type === 'section') {
+      return `<div class="section-card" data-i="${i}">
+        <div class="line-head"><b>Section</b>${moveBtns(i)}</div>
+        <input type="text" data-f="title" value="${esc(l.title)}" placeholder="Section name, e.g. Tanks">
+        <div class="line-amt"><span class="muted">Section subtotal</span><span data-sub="${l.id}"></span></div>
+      </div>`;
+    }
+    n++;
+    return `<div class="line-card ${l.optional ? 'is-optional' : ''}" data-i="${i}">
+      <div class="line-head"><b>Line ${n}${l.code ? ' · ' + esc(l.code) : ''}</b>${moveBtns(i)}</div>
+      <label class="field"><span>Description</span><input type="text" data-f="desc" value="${esc(l.desc)}"></label>
+      <label class="field"><span>Details (optional)</span><input type="text" data-f="note" value="${esc(l.note)}"></label>
+      <div class="grid3">
+        <label class="field"><span>Qty${l.unit && l.unit !== 'each' ? ' (' + esc(l.unit) + ')' : ''}</span><input type="text" inputmode="decimal" data-f="qty" value="${esc(Core.qtyText(l.qty))}"></label>
+        <label class="field"><span>Price</span><input type="text" inputmode="decimal" data-f="price" value="${(l.price / 100).toFixed(2)}"></label>
+        <label class="field"><span>Disc %</span><input type="text" inputmode="decimal" data-f="disc" value="${l.disc ? esc(l.disc) : ''}" placeholder="0"></label>
+      </div>
+      <label class="check opt-check"><input type="checkbox" data-f="optional" ${l.optional ? 'checked' : ''}> Optional item (shown, not added to total)</label>
+      <div class="line-amt"><span class="muted" data-amtlabel>${l.optional ? 'Optional amount' : 'Amount'}</span><span data-amt>${money(Core.lineTotal(l), qed.currency)}</span></div>
+    </div>`;
+  }).join('');
+  $$('[data-i]', box).forEach((card) => {
+    const i = +card.dataset.i;
+    const l = qed.lines[i];
+    $$('input[data-f]', card).forEach((inp) => {
+      const f = inp.dataset.f;
+      inp.addEventListener(inp.type === 'checkbox' ? 'change' : 'input', () => {
+        if (f === 'price') l.price = Core.toCents(inp.value);
+        else if (f === 'qty') l.qty = Core.num(inp.value);
+        else if (f === 'disc') l.disc = Math.min(100, Math.max(0, Core.num(inp.value)));
+        else if (f === 'optional') { l.optional = inp.checked; card.classList.toggle('is-optional', l.optional); $('[data-amtlabel]', card).textContent = l.optional ? 'Optional amount' : 'Amount'; }
+        else l[f] = inp.value;
+        const amt = $('[data-amt]', card);
+        if (amt) amt.textContent = money(Core.lineTotal(l), qed.currency);
+        drawQTotals();
+      });
+      if (['qty', 'price', 'disc'].includes(f)) inp.addEventListener('focus', () => inp.select());
+    });
+    const up = $('[data-up]', card), down = $('[data-down]', card);
+    up.onclick = () => { if (i > 0) { [qed.lines[i - 1], qed.lines[i]] = [qed.lines[i], qed.lines[i - 1]]; drawQLines(false); } };
+    down.onclick = () => { if (i < qed.lines.length - 1) { [qed.lines[i + 1], qed.lines[i]] = [qed.lines[i], qed.lines[i + 1]]; drawQLines(false); } };
+    $('[data-del]', card).onclick = async () => {
+      const what = l.type === 'section' ? `section <b>${esc(l.title || 'without a name')}</b>? Its items stay and join the section above` : `<b>${esc(l.desc || 'this line')}</b> from the quote`;
+      if (!(await confirmBox(l.type === 'section' ? 'Remove section?' : 'Remove line?', `Remove ${what}?`, 'Remove', true))) return;
+      qed.lines.splice(i, 1);
+      drawQLines(false);
+    };
+  });
+  if (focus === 'last') {
+    const last = $$('[data-i]', box).pop();
+    if (last) { last.scrollIntoView({ block: 'center' }); const inp = $('input[data-f=title],input[data-f=desc]', last); if (inp) inp.focus(); }
+  }
+  drawQTotals();
+}
+function drawQTotals() {
+  const t = Core.quoteTotals(qed.lines, qed.vatOn, qed.vatRate, qed.deposit);
+  Core.sectionGroups(qed.lines).forEach((g) => {
+    if (!g.id) return;
+    const el = $(`[data-sub="${g.id}"]`);
+    if (el) el.textContent = money(g.subtotal, qed.currency) + (g.optional ? ' (+ ' + money(g.optional, qed.currency) + ' optional)' : '');
+  });
+  const dp = qed.deposit.type === 'percent' ? ' (' + Core.qtyText(qed.deposit.value) + '%)' : '';
+  $('#qtotals').innerHTML = `
+    <div><span>Subtotal</span><b>${money(t.subtotal, qed.currency)}</b></div>
+    ${qed.vatOn ? `<div><span>VAT (${esc(Core.num(qed.vatRate))}%)</span><b>${money(t.vat, qed.currency)}</b></div>` : ''}
+    <div class="grand"><span>Quote total</span><span>${money(t.total, qed.currency)}</span></div>
+    ${t.optional ? `<div class="muted"><span>Optional items (not in total)</span><span>${money(t.optional, qed.currency)}</span></div>` : ''}
+    ${t.deposit.total ? `<div><span>Deposit required${dp}${qed.vatOn ? ' incl. VAT' : ''}</span><b>${money(t.deposit.total, qed.currency)}</b></div>` : ''}`;
+}
+async function saveQuote(finalise) {
+  const quotes = await DB.all('quotes');
+  qed.number = String(qed.number || '').trim();
+  if (!qed.number) { toast('Quote number is required'); return; }
+  if (Core.isDuplicate(qed.number, quotes, qed.id) || (!qed.rev && quotes.some((q) => q.id !== qed.id && q.baseNumber && Core.norm(q.baseNumber) === Core.norm(qed.number)))) {
+    await alertBox('Duplicate number', `Quote number <b>${esc(qed.number)}</b> is already used. The next free number is <b>${esc(Core.nextQuoteNumber(S, quotes.filter((q) => q.id !== qed.id)))}</b>.`);
+    return;
+  }
+  if (!qed.date) { toast('Quote date is required'); return; }
+  if (!qed.validUntil) qed.validUntil = Core.addDays(qed.date, S.quoteValidDays);
+  if (qed.validUntil < qed.date) { toast('“Valid until” is before the quote date'); return; }
+  // drop empty lines and nameless sections
+  qed.lines = qed.lines.filter((l) => (l.type === 'section' ? (l.title || '').trim() : ((l.desc || '').trim() || l.price)));
+  if (!qed.rev) qed.baseNumber = qed.number;
+  if (finalise) {
+    if (!qed.customer) { toast('Please select a customer'); return; }
+    if (!qed.lines.some((l) => l.type !== 'section')) { toast('Add at least one line item'); drawQLines(false); return; }
+    if (qed.state !== 'final') {
+      const ok = await confirmBox('Finalise quote?', `Quote <b>${esc(qed.number)}</b> will be finalised (status: Sent) and keep this number.`, 'Finalise');
+      if (!ok) return;
+      qed.finalisedAt = Date.now();
+      qed.status = 'sent';
+    }
+    qed.state = 'final';
+    qed.company = snapshotCompany();
+  }
+  const t = Core.quoteTotals(qed.lines, qed.vatOn, qed.vatRate, qed.deposit);
+  Object.assign(qed, { subtotal: t.subtotal, vat: t.vat, total: t.total, optionalTotal: t.optional, depositTotal: t.deposit.total, updatedAt: Date.now() });
+  delete qed._validTouched;
+  await DB.put('quotes', qed);
+  if (qed.state === 'final' && !qed.rev && Core.bumpQuoteLast(S, qed.number)) await saveSettings();
+  toast(finalise ? 'Quote finalised' : 'Draft saved');
+  location.replace('#qview/' + qed.id);
+}
+
+/* ---------- detail ---------- */
+async function renderQuoteView(id) {
+  const q = await DB.get('quotes', id);
+  if (!q) { view.innerHTML = '<div class="empty">Quote not found.</div><a class="btn block" href="#quotes">Back to quotes</a>'; return; }
+  const [quotes, invoices] = await Promise.all([DB.all('quotes'), DB.all('invoices')]);
+  const st = quoteStatusOf(q);
+  const t = Core.quoteTotals(q.lines, q.vatOn, q.vatRate, q.deposit);
+  const linked = invoices.filter((i) => i.quoteId === q.id || (q.invoiceIds || []).includes(i.id));
+  const base = q.baseNumber || q.number;
+  const versions = sortQuotes(quotes.filter((x) => x.id !== q.id && Core.norm(x.baseNumber || x.number) === Core.norm(base)));
+  const dp = q.deposit && q.deposit.type === 'percent' ? ' (' + Core.qtyText(q.deposit.value) + '%)' : '';
+  view.innerHTML = `
+    <div class="card">
+      <div class="inv-head">
+        <div><div class="muted small">Quotation</div><h2>${esc(q.number)}</h2><div style="margin-top:4px">${quoteBadge(q)}</div></div>
+        <div class="right"><div class="muted small">Total</div><div class="amount">${money(t.total, q.currency)}</div></div>
+      </div>
+      <dl class="kv">
+        <dt>Customer</dt><dd>${esc((q.customer && q.customer.name) || '—')}</dd>
+        ${q.title ? `<dt>Title</dt><dd>${esc(q.title)}</dd>` : ''}
+        <dt>Date</dt><dd>${esc(Core.fmtDate(q.date))}</dd>
+        <dt>Valid until</dt><dd>${esc(Core.fmtDate(q.validUntil))}</dd>
+        ${t.optional ? `<dt>Optional items</dt><dd>${money(t.optional, q.currency)} (not in total)</dd>` : ''}
+        ${t.deposit.total ? `<dt>Deposit${dp}</dt><dd>${money(t.deposit.total, q.currency)}</dd>` : ''}
+      </dl>
+    </div>
+    <div class="grid4">
+      <button class="btn tile" id="aPrev">${ICON.eye}Preview</button>
+      <button class="btn tile" id="aDown">${ICON.down}Download PDF</button>
+      <button class="btn tile" id="aPrint">${ICON.print}Print</button>
+      <button class="btn tile primary" id="aShare">${ICON.share}Share</button>
+    </div>
+    ${q.state === 'draft' ? '<p class="muted small">Drafts print with a DRAFT watermark. Finalise to send.</p>' : `
+    <h3>Status</h3>
+    ${st === 'expired' ? `<p class="small muted" style="margin-top:-4px">Expired on ${esc(Core.fmtDate(q.validUntil))}. You can still mark it Accepted, or make a new revision with new dates.</p>` : ''}
+    <div class="seg">${['sent', 'accepted', 'declined'].map((s) => `<button class="q-${s} ${s === (st === 'expired' ? '' : st) ? 'on' : ''}" data-qst="${s}">${QSTATUS_LABEL[s]}</button>`).join('')}</div>`}
+    ${st === 'accepted' ? `<div class="spacer"></div><button class="btn primary block big" id="aConvert">Convert to invoice</button>` : ''}
+    ${linked.length ? `<h3>Invoices from this quote</h3><div class="list">${sortInvoices(linked).map(invoiceRow).join('')}</div>` : ''}
+    ${versions.length ? `<h3>Other versions</h3><div class="list">${versions.map(quoteRow).join('')}</div>` : ''}
+    <h3>Actions</h3>
+    <div class="btn-row">
+      <button class="btn" id="aEdit">${ICON.edit} Edit</button>
+      <button class="btn" id="aDup">${ICON.copy} Duplicate</button>
+      ${q.state === 'final' ? `<button class="btn" id="aRev">${ICON.plus} New revision</button>` : ''}
+      <button class="btn danger" id="aDel">${ICON.trash} Delete</button>
+    </div>`;
+  bindOpen(view);
+  bindOpenQuote(view);
+  $('#aPrev').onclick = () => withQuotePdf(q, (bytes) => previewPdf(bytes, 'Quotation ' + q.number));
+  $('#aDown').onclick = () => withQuotePdf(q, (bytes, name) => { downloadBlob(new Blob([bytes], { type: 'application/pdf' }), name); toast('PDF downloaded'); });
+  $('#aPrint').onclick = () => withQuotePdf(q, (bytes, name) => printPdf(bytes, name));
+  $('#aShare').onclick = () => withQuotePdf(q, (bytes, name) => sharePdf(bytes, name, q));
+  $$('[data-qst]', view).forEach((b) => {
+    b.onclick = async () => {
+      q.status = b.dataset.qst;
+      q.acceptedAt = q.status === 'accepted' ? Core.todayISO() : null;
+      q.updatedAt = Date.now();
+      await DB.put('quotes', q);
+      toast('Marked as ' + QSTATUS_LABEL[q.status]);
+      renderQuoteView(id);
+    };
+  });
+  if ($('#aConvert')) $('#aConvert').onclick = () => convertQuoteSheet(q, linked);
+  $('#aEdit').onclick = () => { location.hash = '#qedit/' + q.id; };
+  $('#aDup').onclick = () => {
+    const today = Core.todayISO();
+    const copy = {
+      customerId: q.customerId, customer: q.customer, title: q.title, scope: q.scope, vatOn: q.vatOn, vatRate: q.vatRate,
+      deposit: q.deposit, exclusions: q.exclusions, terms: q.terms, date: today, validUntil: Core.addDays(today, S.quoteValidDays),
+      lines: (q.lines || []).map((l) => Object.assign({}, l, { id: uid() }))
+    };
+    sessionStorage.setItem('dupQuote', JSON.stringify(copy));
+    location.hash = '#qedit/new';
+    toast('Copied — new number assigned');
+  };
+  if ($('#aRev')) $('#aRev').onclick = async () => {
+    const all = await DB.all('quotes');
+    const r = Core.nextRevision(base, all);
+    if (!(await confirmBox('New revision?', `Creates <b>${esc(r.number)}</b> as a draft copy you can change. <b>${esc(q.number)}</b> is kept as it is.`, 'Create revision'))) return;
+    const today = Core.todayISO();
+    const nq = JSON.parse(JSON.stringify(q));
+    Object.assign(nq, {
+      id: uid(), number: r.number, baseNumber: base, rev: r.rev, revOf: q.id, state: 'draft', status: 'sent',
+      date: today, validUntil: Core.addDays(today, S.quoteValidDays), invoiceIds: [], acceptedAt: null, finalisedAt: null,
+      createdAt: Date.now(), updatedAt: Date.now()
+    });
+    delete nq.company;
+    nq.lines = (nq.lines || []).map((l) => Object.assign({}, l, { id: uid() }));
+    await DB.put('quotes', nq);
+    toast('Revision ' + r.number + ' created');
+    location.hash = '#qedit/' + nq.id;
+  };
+  $('#aDel').onclick = async () => {
+    const extra = linked.length ? '<br><br>Invoices made from it are kept.' : '';
+    if (!(await confirmBox('Delete quote?', `Delete quote <b>${esc(q.number)}</b>? This cannot be undone.${extra}`, 'Delete', true))) return;
+    await DB.del('quotes', q.id);
+    toast('Quote deleted');
+    location.replace('#quotes');
+  };
+}
+async function withQuotePdf(q, fn) {
+  if (busy) return;
+  busy = true;
+  try {
+    const bytes = await buildQuotePdf(q, S);
+    await fn(bytes, 'Quotation-' + safeName(q.number) + '.pdf');
+  } catch (e) {
+    console.error(e);
+    alertBox('PDF problem', esc(e.message || String(e)));
+  } finally { busy = false; }
+}
+
+/* ---------- convert to invoice ---------- */
+function convertQuoteSheet(q, linked) {
+  const t = Core.quoteTotals(q.lines, q.vatOn, q.vatRate, q.deposit);
+  const opts = (q.lines || []).filter((l) => l.type !== 'section' && l.optional);
+  const depInvs = linked.filter((i) => i.quoteKind === 'deposit');
+  const hasFull = linked.some((i) => i.quoteKind === 'full' || i.quoteKind === 'balance');
+  const kinds = [['full', 'Full amount', money(t.total, q.currency)]];
+  if (t.deposit.total) kinds.unshift(['deposit', 'Deposit only', money(t.deposit.total, q.currency)]);
+  if (depInvs.length) kinds.push(['balance', 'Balance (full amount less deposit invoiced)', '']);
+  const def = depInvs.length ? 'balance' : (t.deposit.total && !linked.length ? 'deposit' : 'full');
+  const body = openSheet('Convert to invoice', `
+    <p class="small muted" style="margin-top:0">Creates a draft invoice with the next invoice number, linked to <b>${esc(q.number)}</b>. Check it, then tap Finalise.</p>
+    ${hasFull ? '<div class="notice small">This quote already has a full invoice. Only continue if you need another one.</div>' : ''}
+    <div class="radio-list">${kinds.map(([k, label, amt]) => `<label class="check"><input type="radio" name="cvKind" value="${k}" ${k === def ? 'checked' : ''}> <span>${esc(label)}${amt ? ' · <b>' + amt + '</b>' : ''}</span></label>`).join('')}</div>
+    ${opts.length ? `<div id="cvOpts"><h3>Include optional items?</h3>${opts.map((l) => `<label class="check"><input type="checkbox" data-opt="${l.id}"> <span>${esc(l.desc || 'Optional item')} · ${money(Core.lineTotal(l), q.currency)}</span></label>`).join('')}</div>` : ''}
+    <div class="card totals" id="cvTot" style="margin-top:12px"></div>
+    <button class="btn primary block big" id="cvGo">Create invoice</button>`);
+  const kindOf = () => ($('input[name=cvKind]:checked', body) || {}).value || 'full';
+  const ticked = () => $$('[data-opt]', body).filter((c) => c.checked).map((c) => c.dataset.opt);
+  const deps = () => depInvs.map((i) => ({ number: i.number, excl: i.subtotal != null ? i.subtotal : Core.totals(i.lines, i.vatOn, i.vatRate).subtotal }));
+  const preview = () => {
+    const k = kindOf();
+    if ($('#cvOpts', body)) $('#cvOpts', body).hidden = k === 'deposit';
+    const lines = Core.quoteToInvoiceLines(q, k, ticked(), deps());
+    const tt = Core.totals(lines, q.vatOn, q.vatRate);
+    $('#cvTot', body).innerHTML = `<div><span>Invoice lines</span><b>${lines.length}</b></div>
+      <div><span>Subtotal</span><b>${money(tt.subtotal, q.currency)}</b></div>
+      ${q.vatOn ? `<div><span>VAT</span><b>${money(tt.vat, q.currency)}</b></div>` : ''}
+      <div class="grand"><span>Invoice total</span><span>${money(tt.total, q.currency)}</span></div>`;
+  };
+  $$('input', body).forEach((i) => i.addEventListener('change', preview));
+  preview();
+  $('#cvGo', body).onclick = async () => {
+    const k = kindOf();
+    const invoices = await DB.all('invoices');
+    const date = Core.todayISO();
+    const inv = {
+      id: uid(), number: Core.nextNumber(S, invoices), state: 'draft', status: 'unpaid', source: 'app',
+      date, due: Core.addDays(date, S.terms), customerId: q.customerId, customer: q.customer,
+      lines: Core.quoteToInvoiceLines(q, k, ticked(), deps()).map((l) => newLine(l)),
+      po: '', ref: q.number, notes: S.notes || '', vatOn: !!q.vatOn, vatRate: Core.num(q.vatRate), currency: q.currency || S.currency,
+      quoteId: q.id, quoteNumber: q.number, quoteKind: k, createdAt: Date.now(), updatedAt: Date.now()
+    };
+    Object.assign(inv, Core.totals(inv.lines, inv.vatOn, inv.vatRate));
+    await DB.put('invoices', inv);
+    const fresh = (await DB.get('quotes', q.id)) || q;
+    fresh.invoiceIds = Array.from(new Set([...(fresh.invoiceIds || []), inv.id]));
+    fresh.updatedAt = Date.now();
+    await DB.put('quotes', fresh);
+    closeSheet();
+    toast('Invoice ' + inv.number + ' created — check it and tap Finalise', 4000);
+    location.hash = '#edit/' + inv.id;
   };
 }
 
@@ -957,13 +1514,17 @@ window.addEventListener('afterprint', () => { $('#printArea').innerHTML = ''; })
 /* ---------------------------------------------------------------------
    PDF GENERATION (A4, matches the supplied sample layout)
    --------------------------------------------------------------------- */
-async function buildInvoicePdf(inv, settings) {
+async function buildInvoicePdf(inv, settings) { return buildDocPdf(inv, settings, 'invoice'); }
+async function buildQuotePdf(q, settings) { return buildDocPdf(q, settings, 'quote'); }
+/** One A4 layout for both documents. kind: 'invoice' | 'quote' (QUOTATION with sections, optional items, deposit, T&Cs, acceptance). */
+async function buildDocPdf(inv, settings, kind) {
+  const isQ = kind === 'quote';
   const { PDFDocument, StandardFonts, rgb, degrees } = PDFLib;
   const doc = await PDFDocument.create();
   const snap = inv.state === 'final' && inv.company ? inv.company : { company: settings.company, bank: settings.bank, footer: settings.footer };
   const co = snap.company || {}, bank = snap.bank || {};
   const cur = inv.currency || settings.currency || 'R';
-  doc.setTitle('Invoice ' + inv.number);
+  doc.setTitle((isQ ? 'Quotation ' : 'Invoice ') + inv.number);
   doc.setAuthor(co.name || '');
   doc.setCreator('Invoices PWA');
   doc.setProducer('Invoices PWA');
@@ -972,6 +1533,7 @@ async function buildInvoicePdf(inv, settings) {
   const W = 595.28, H = 841.89, L = 52, R = 546, IL = 60, IR = 538;
   const INK = rgb(0.11, 0.12, 0.14), GREY = rgb(0.42, 0.45, 0.5), SLATE = rgb(0.33, 0.38, 0.49);
   const LINE = rgb(0.89, 0.9, 0.92), HEAD = rgb(0.953, 0.957, 0.965), BAND = rgb(0.918, 0.953, 0.984);
+  const ACCENT = rgb(0.12, 0.31, 0.47);
   const okCache = new Map();
   const clean = (font, s) => {
     let out = '';
@@ -1021,7 +1583,7 @@ async function buildInvoicePdf(inv, settings) {
 
   newPage();
   // ---- Header: title + company (left), logo (right)
-  T('INVOICE', L, 80, 20, B);
+  T(isQ ? 'QUOTATION' : 'INVOICE', L, 80, 20, B);
   let y = 104;
   wrap(co.name || '', B, 12, 280).forEach((ln) => { T(ln, L, y, 12, B); y += 14; });
   y += 1;
@@ -1057,14 +1619,20 @@ async function buildInvoicePdf(inv, settings) {
   if (c.vatNo) left.push('VAT no: ' + c.vatNo);
   const nameLines = wrap(c.name || '', B, 11, 250);
   const leftEnd = boxTop + 30 + (nameLines.length - 1) * 13 + 4 + left.reduce((a, t) => a + wrap(t, F, 8, 250).length, 0) * 10.5;
-  const rows = [['INVOICE NUMBER', inv.number], ['ISSUED', Core.fmtDate(inv.date)]];
-  if (inv.due) rows.push(['DUE', Core.fmtDate(inv.due)]);
-  if (inv.po) rows.push(['PO NUMBER', inv.po]);
-  if (inv.ref) rows.push(['REFERENCE', inv.ref]);
+  const rows = isQ
+    ? [['QUOTE NUMBER', inv.number], ['DATE', Core.fmtDate(inv.date)]]
+    : [['INVOICE NUMBER', inv.number], ['ISSUED', Core.fmtDate(inv.date)]];
+  if (isQ) {
+    if (inv.validUntil) rows.push(['VALID UNTIL', Core.fmtDate(inv.validUntil)]);
+  } else {
+    if (inv.due) rows.push(['DUE', Core.fmtDate(inv.due)]);
+    if (inv.po) rows.push(['PO NUMBER', inv.po]);
+    if (inv.ref) rows.push(['REFERENCE', inv.ref]);
+  }
   const rightEnd = boxTop + 16 + (rows.length - 1) * 20.5;
   const boxH = Math.max(74, Math.max(leftEnd, rightEnd) - boxTop + 14);
   rrect(L, boxTop, R - L, boxH, 5, { borderColor: LINE, borderWidth: 0.8 });
-  T('BILL TO', IL, boxTop + 15, 6.5, B);
+  T(isQ ? 'PREPARED FOR' : 'BILL TO', IL, boxTop + 15, 6.5, B);
   let ly = boxTop + 30;
   nameLines.forEach((ln) => { T(ln, IL, ly, 11, B); ly += 13; });
   ly += 1;
@@ -1076,7 +1644,27 @@ async function buildInvoicePdf(inv, settings) {
   });
 
   // ---- Items table
-  const lines = inv.lines || [];
+  const LIMIT = 780;
+  const contPage = () => {
+    newPage();
+    T((isQ ? 'QUOTATION ' : 'INVOICE ') + inv.number + ' (continued)', L, 60, 9, B, GREY);
+    return 76;
+  };
+  // quote: project title + scope of work above the table
+  let tableTop = boxTop + boxH + 20;
+  if (isQ && ((inv.title || '').trim() || (inv.scope || '').trim())) {
+    y = boxTop + boxH + 24;
+    if ((inv.title || '').trim()) {
+      wrap(inv.title.trim(), B, 12, R - L).forEach((ln) => { if (y > LIMIT) y = contPage(); T(ln, L, y, 12, B); y += 15; });
+      y += 4;
+    }
+    if ((inv.scope || '').trim()) {
+      T('SCOPE OF WORK', L, y, 6.5, B); y += 12;
+      wrap(inv.scope.trim(), F, 8.5, R - L).forEach((ln) => { if (y > LIMIT) y = contPage(); T(ln, L, y, 8.5, F, SLATE); y += 11; });
+    }
+    tableTop = y + 10;
+  }
+  const lines = (inv.lines || []).filter((r) => r.type !== 'section');
   const hasDisc = lines.some((l) => Core.num(l.disc) > 0);
   const col = hasDisc ? { price: 318, qty: 384, disc: 446, descW: 225 } : { price: 360, qty: 435, descW: 255 };
   const drawHead = (top) => {
@@ -1088,15 +1676,9 @@ async function buildInvoicePdf(inv, settings) {
     T('AMOUNT', IR, top + 10.5, 6.5, B, INK, 'right');
     return top + 16 + 14;
   };
-  const LIMIT = 780;
-  const contPage = () => {
-    newPage();
-    T('INVOICE ' + inv.number + ' (continued)', L, 60, 9, B, GREY);
-    return 76;
-  };
-  y = drawHead(boxTop + boxH + 20);
-  lines.forEach((l) => {
-    const dl = wrap(l.desc || '', F, 9, col.descW);
+  y = drawHead(tableTop > LIMIT - 60 ? contPage() : tableTop);
+  const drawLine = (l) => {
+    const dl = wrap((l.optional ? '[Optional] ' : '') + (l.desc || ''), F, 9, col.descW);
     const nl = l.note ? wrap(l.note, F, 8, col.descW) : [];
     const h = dl.length * 11 + nl.length * 12;
     if (y + h > LIMIT) y = drawHead(contPage());
@@ -1104,15 +1686,33 @@ async function buildInvoicePdf(inv, settings) {
     T(money(l.price, cur), col.price, y, 9, F, INK, 'center');
     T(Core.qtyText(l.qty) + unit, col.qty, y, 9, F, INK, 'center');
     if (hasDisc) T(Core.num(l.disc) > 0 ? Core.qtyText(l.disc) + '%' : '', col.disc, y, 9, F, INK, 'center');
-    T(money(Core.lineTotal(l), cur), IR, y, 9, F, INK, 'right');
-    dl.forEach((ln) => { T(ln, IL, y, 9, F); y += 11; });
+    T(money(Core.lineTotal(l), cur), IR, y, 9, F, l.optional ? SLATE : INK, 'right');
+    dl.forEach((ln) => { T(ln, IL, y, 9, F, l.optional ? SLATE : INK); y += 11; });
     y += 1;
     nl.forEach((ln) => { T(ln, IL, y, 8, F, SLATE); y += 12; });
     y += 13;
-  });
+  };
+  if (!isQ) lines.forEach(drawLine);
+  else {
+    Core.sectionGroups(inv.lines).forEach((g) => {
+      if (g.title) {
+        if (y + 40 > LIMIT) y = drawHead(contPage());
+        T(g.title.toUpperCase(), IL, y, 8.5, B, ACCENT);
+        y += 16;
+      }
+      g.lines.forEach(drawLine);
+      if (g.title) {
+        if (y + 16 > LIMIT) y = drawHead(contPage());
+        page.drawLine({ start: { x: 380, y: H - (y - 9) }, end: { x: R, y: H - (y - 9) }, thickness: 0.5, color: LINE });
+        T(g.title + ' subtotal', 470, y + 1, 8, B, INK, 'right');
+        T(money(g.subtotal, cur), IR, y + 1, 8, B, INK, 'right');
+        y += 22;
+      }
+    });
+  }
 
   // ---- Totals
-  const totals = Core.totals(lines, inv.vatOn, inv.vatRate);
+  const totals = isQ ? Core.quoteTotals(inv.lines, inv.vatOn, inv.vatRate, inv.deposit) : Core.totals(lines, inv.vatOn, inv.vatRate);
   const tRows = [['Subtotal', totals.subtotal]];
   if (inv.vatOn) tRows.push(['VAT (' + Core.qtyText(inv.vatRate) + '%)', totals.vat]);
   tRows.push(['Total', totals.total]);
@@ -1123,7 +1723,7 @@ async function buildInvoicePdf(inv, settings) {
   if (bank.branch) bankLines.push('Branch code: ' + bank.branch);
   if (bank.type) bankLines.push('Account type: ' + bank.type);
   bankLines.push('Reference: ' + (bank.reference ? bank.reference.replace(/\{number\}/gi, inv.number) : inv.number));
-  const noteLines = inv.notes ? wrap(inv.notes, F, 8, R - L) : [];
+  const noteLines = !isQ && inv.notes ? wrap(inv.notes, F, 8, R - L) : [];
   const needed = 16 + tRows.length * 15.5 + 34 + 40 + bankLines.length * 15.5 + (noteLines.length ? 22 + noteLines.length * 11 : 0);
   if (y + Math.min(needed, 240) > LIMIT) y = contPage();
   y += 8;
@@ -1131,14 +1731,28 @@ async function buildInvoicePdf(inv, settings) {
   y += 12;
   tRows.forEach(([k, v]) => { T(k, 305, y, 7.5, F); T(money(v, cur), IR, y, 7.5, F, INK, 'right'); y += 15.5; });
   y += 18;
-  T('Amount due', 334, y, 12, B);
+  T(isQ ? 'Quote total' : 'Amount due', 334, y, 12, B);
   T(money(totals.total, cur), IR, y, 12, B, INK, 'right');
-  if (inv.status === 'paid' && inv.state === 'final') { y += 15; T('PAID - thank you', IR, y, 8, B, rgb(0.08, 0.5, 0.24), 'right'); }
+  if (!isQ && inv.status === 'paid' && inv.state === 'final') { y += 15; T('PAID - thank you', IR, y, 8, B, rgb(0.08, 0.5, 0.24), 'right'); }
+  if (isQ && totals.optional > 0) {
+    y += 16;
+    T('Optional items (not included in total)', 305, y, 7.5, F, SLATE);
+    T(money(totals.optional, cur), IR, y, 7.5, F, SLATE, 'right');
+  }
+  if (isQ && totals.deposit.total > 0) {
+    y += 20;
+    const dp = inv.deposit.type === 'percent' ? ' (' + Core.qtyText(inv.deposit.value) + '%)' : '';
+    rrect(299, y - 12, R - 299, 18, 3, { color: BAND });
+    T('Deposit required' + dp, 305, y, 8.5, B);
+    T(money(totals.deposit.total, cur), IR, y, 8.5, B, INK, 'right');
+    if (inv.vatOn) { y += 13; T('incl. VAT of ' + money(totals.deposit.vat, cur) + ', payable on acceptance', IR, y, 7, F, GREY, 'right'); }
+    else { y += 13; T('payable on acceptance', IR, y, 7, F, GREY, 'right'); }
+  }
 
   // ---- Payment instruction
   y += 32;
   if (y + 15 + bankLines.length * 15.5 > LIMIT) y = contPage();
-  T('Payment instruction', L, y, 8, F);
+  T(isQ ? 'Banking details' : 'Payment instruction', L, y, 8, isQ ? B : F);
   y += 15.5;
   bankLines.forEach((t) => { T(t, L, y, 8, F); y += 15.5; });
 
@@ -1148,6 +1762,32 @@ async function buildInvoicePdf(inv, settings) {
     if (y + 12 > LIMIT) y = contPage();
     T('Notes', L, y, 8, B); y += 13;
     noteLines.forEach((ln) => { if (y > LIMIT) y = contPage(); T(ln, L, y, 8, F, GREY); y += 11; });
+  }
+
+  // ---- Quote: exclusions, terms, acceptance block
+  if (isQ) {
+    const block = (title, text) => {
+      const ls = wrap(String(text || '').trim(), F, 8, R - L);
+      if (!ls.length || !String(text || '').trim()) return;
+      y += 12;
+      if (y + 24 > LIMIT) y = contPage();
+      T(title, L, y, 8, B); y += 13;
+      ls.forEach((ln) => { if (y > LIMIT) y = contPage(); T(ln, L, y, 8, F, GREY); y += 11; });
+    };
+    block('Exclusions', inv.exclusions);
+    block('Terms & Conditions', inv.terms);
+    const boxHt = 92;
+    y += 20;
+    if (y + boxHt > LIMIT + 10) y = contPage() + 4;
+    rrect(L, y, R - L, boxHt, 5, { borderColor: LINE, borderWidth: 0.8 });
+    T('ACCEPTANCE', IL, y + 16, 6.5, B);
+    T('I/We accept this quotation (' + inv.number + ') and its terms and conditions.', IL, y + 30, 8, F, GREY);
+    const cols = [['Accepted by (name)', IL, 200], ['Signature', 270, 150], ['Date', 432, 106]];
+    cols.forEach(([lab, x, w]) => {
+      page.drawLine({ start: { x, y: H - (y + 66) }, end: { x: x + w - 12, y: H - (y + 66) }, thickness: 0.6, color: GREY });
+      T(lab, x, y + 78, 7, F, GREY);
+    });
+    y += boxHt;
   }
 
   // ---- Footer band + page numbers + draft watermark on every page
@@ -1274,6 +1914,7 @@ async function openImportReview(results) {
    --------------------------------------------------------------------- */
 async function renderSettings() {
   const invoices = await DB.all('invoices');
+  const quotes = await DB.all('quotes');
   const g = (path) => path.split('.').reduce((o, k) => (o == null ? '' : o[k]), S);
   const f = (label, path, type, extra) => field(label, path, g(path) == null ? '' : g(path), type, (extra || '') + ' data-path="' + path + '"');
   view.innerHTML = `
@@ -1298,11 +1939,11 @@ async function renderSettings() {
       ${f('Account holder', 'bank.holder')}
       <div class="grid2">${f('Account number', 'bank.account', 'text', 'inputmode="numeric"')}${f('Branch code', 'bank.branch', 'text', 'inputmode="numeric"')}</div>
       ${f('Account type', 'bank.type')}
-      ${f('Payment reference instructions (use {number} for the invoice no.)', 'bank.reference')}
+      ${f('Payment reference instructions (use {number} for the invoice/quote no.)', 'bank.reference')}
     </div>
     <h3>Tax, currency &amp; terms</h3>
     <div class="card">
-      <label class="check"><input type="checkbox" data-path="vatEnabled" ${S.vatEnabled ? 'checked' : ''}> Charge VAT on new invoices</label>
+      <label class="check"><input type="checkbox" data-path="vatEnabled" ${S.vatEnabled ? 'checked' : ''}> Charge VAT on new invoices and quotes</label>
       <div class="grid3">${f('VAT rate %', 'vatRate', 'text', 'inputmode="decimal"')}${f('Currency symbol', 'currency')}${f('Payment terms (days)', 'terms', 'text', 'inputmode="numeric"')}</div>
       ${f('Default invoice notes', 'notes', 'textarea')}
       ${f('Footer text (bottom of every page)', 'footer')}
@@ -1312,6 +1953,14 @@ async function renderSettings() {
       <div class="grid2">${f('Prefix', 'prefix')}${f('Last invoice number used', 'lastNumber', 'text', 'inputmode="numeric"')}</div>
       <p class="small">Next invoice will be: <b id="nextNo"></b></p>
     </div>
+    <h3>Quotes</h3>
+    <div class="card">
+      <div class="grid2">${f('Quote prefix', 'quotePrefix')}${f('Last quote number used', 'quoteLastNumber', 'text', 'inputmode="numeric"')}</div>
+      <p class="small" style="margin-top:-4px">Next quote will be: <b id="nextQNo"></b></p>
+      ${f('Quotes valid for (days)', 'quoteValidDays', 'text', 'inputmode="numeric"')}
+      ${f('Default exclusions', 'quoteExclusions', 'textarea')}
+      ${f('Default Terms & Conditions', 'quoteTerms', 'textarea', 'rows="7"')}
+    </div>
     <h3>Appearance</h3>
     <div class="card">
       <label class="field"><span>Theme</span><select data-path="theme">
@@ -1320,7 +1969,7 @@ async function renderSettings() {
     </div>
     <h3>Backup &amp; restore</h3>
     <div class="card">
-      <p class="small muted" style="margin-top:0">Saves everything (company, logo, customers, equipment, invoices, imported PDFs, settings) to one file. Keep a copy off your phone.</p>
+      <p class="small muted" style="margin-top:0">Saves everything (company, logo, customers, equipment, quotes, invoices, imported PDFs, settings) to one file. Keep a copy off your phone.</p>
       <div class="btn-row"><button class="btn primary" id="bExport">${ICON.down} Export backup</button><button class="btn" id="bImport">${ICON.upload} Restore backup</button></div>
     </div>
     <h3>App</h3>
@@ -1330,7 +1979,12 @@ async function renderSettings() {
       <div class="btn-row"><button class="btn" id="sUpdate">Check for updates</button><button class="btn danger" id="sWipe">${ICON.trash} Erase all data</button></div>
     </div>`;
 
-  const showNext = () => { $('#nextNo').textContent = Core.nextNumber(S, invoices); };
+  const showNext = () => {
+    // the field may save on blur after the user has already left Settings
+    const a = $('#nextNo'), b = $('#nextQNo');
+    if (a) a.textContent = Core.nextNumber(S, invoices);
+    if (b) b.textContent = Core.nextQuoteNumber(S, quotes);
+  };
   showNext();
   $$('[data-path]', view).forEach((el) => {
     const save = async () => {
@@ -1338,6 +1992,11 @@ async function renderSettings() {
       let val = el.type === 'checkbox' ? el.checked : el.value.trim();
       if (path === 'vatRate') { val = Core.num(val); el.value = val; }
       if (path === 'terms') { val = Math.max(0, parseInt(val, 10) || 0); el.value = val; }
+      if (path === 'quoteValidDays') { val = Math.max(1, parseInt(val, 10) || 30); el.value = val; }
+      if (path === 'quoteLastNumber') {
+        if (!/^\d*$/.test(val)) { toast('Use digits only, e.g. 1049'); el.value = S.quoteLastNumber; return; }
+        val = val || '0';
+      }
       if (path === 'lastNumber') {
         if (!/^\d*$/.test(val)) { toast('Use digits only, e.g. 1047'); el.value = S.lastNumber; return; }
         val = val || '0';
@@ -1358,6 +2017,10 @@ async function renderSettings() {
       const tmp = Object.assign({}, S, { [el.dataset.path]: el.value.trim() });
       $('#nextNo').textContent = Core.nextNumber(tmp, invoices);
     });
+    if (el.dataset.path === 'quotePrefix' || el.dataset.path === 'quoteLastNumber') el.addEventListener('input', () => {
+      const tmp = Object.assign({}, S, { [el.dataset.path]: el.value.trim() });
+      $('#nextQNo').textContent = Core.nextQuoteNumber(tmp, quotes);
+    });
   });
   $('#logoPick').onclick = () => $('#pickLogo').click();
   if (S.logo) $('#logoDel').onclick = async () => {
@@ -1368,7 +2031,7 @@ async function renderSettings() {
   $('#bImport').onclick = () => $('#pickBackup').click();
   $('#sUpdate').onclick = checkForUpdate;
   $('#sWipe').onclick = async () => {
-    if (!(await confirmBox('Erase all data?', 'This deletes all invoices, customers, equipment and settings on this phone.', 'Continue', true))) return;
+    if (!(await confirmBox('Erase all data?', 'This deletes all quotes, invoices, customers, equipment and settings on this phone.', 'Continue', true))) return;
     if (!(await confirmBox('Are you sure?', 'Make sure you have a backup. This cannot be undone.', 'Erase everything', true))) return;
     for (const s of STORES) await DB.clear(s);
     await loadSettings();
@@ -1427,7 +2090,7 @@ function b64ToBuf(b64) {
 async function exportBackup() {
   const data = {
     app: 'invoice-pwa', version: APP_VERSION, exportedAt: new Date().toISOString(),
-    settings: S, customers: await DB.all('customers'), items: await DB.all('items'), invoices: await DB.all('invoices'),
+    settings: S, customers: await DB.all('customers'), items: await DB.all('items'), invoices: await DB.all('invoices'), quotes: await DB.all('quotes'),
     files: (await DB.all('files')).map((f) => ({ id: f.id, name: f.name, data: bufToB64(f.data) }))
   };
   const name = 'invoices-backup-' + Core.todayISO() + '.json';
@@ -1456,13 +2119,14 @@ $('#pickBackup').addEventListener('change', async (e) => {
   try { data = JSON.parse(await file.text()); } catch (err) { alertBox('Restore failed', 'That file is not a valid backup.'); return; }
   if (!data || data.app !== 'invoice-pwa' || !data.settings) { alertBox('Restore failed', 'That file is not a backup from this app.'); return; }
   const n = (data.invoices || []).length;
-  if (!(await confirmBox('Restore backup?', `This replaces ALL data on this phone with the backup from <b>${esc((data.exportedAt || '').slice(0, 10))}</b> (${n} invoices, ${(data.customers || []).length} customers).`, 'Restore', true))) return;
+  if (!(await confirmBox('Restore backup?', `This replaces ALL data on this phone with the backup from <b>${esc((data.exportedAt || '').slice(0, 10))}</b> (${n} invoices, ${(data.quotes || []).length} quotes, ${(data.customers || []).length} customers).`, 'Restore', true))) return;
   try {
     for (const s of STORES) await DB.clear(s);
     await DB.put('settings', Object.assign({}, data.settings, { key: 'main' }));
     for (const c of data.customers || []) await DB.put('customers', c);
     for (const i of data.items || []) await DB.put('items', i);
     for (const i of data.invoices || []) await DB.put('invoices', i);
+    for (const q of data.quotes || []) await DB.put('quotes', q);
     for (const f of data.files || []) await DB.put('files', { id: f.id, name: f.name, data: b64ToBuf(f.data) });
     await loadSettings();
     toast('Backup restored');
@@ -1603,5 +2267,5 @@ $('#btnUpdate').onclick = checkForUpdate;
 })();
 
 // exposed for automated tests
-window.__app = { DB, buildInvoicePdf, getSettings: () => S, loadSettings };
+window.__app = { DB, buildInvoicePdf, buildQuotePdf, getSettings: () => S, loadSettings };
 }
