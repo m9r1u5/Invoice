@@ -1,4 +1,5 @@
 name: Build Android APK
+# Builds the Android APK for every app update (see README).
 
 # Runs every time you upload/commit files to main, or manually from the Actions tab.
 on:
