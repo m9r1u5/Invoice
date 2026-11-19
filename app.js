@@ -3,7 +3,7 @@
    Invoices PWA — offline invoicing (IndexedDB + pdf-lib + pdf.js)
    To publish an update: bump APP_VERSION here AND VERSION in sw.js.
    ===================================================================== */
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.1.1';
 
 /* ---------------------------------------------------------------------
    CORE: pure logic (money, VAT, dates, numbering, PDF text extraction)
@@ -451,6 +451,11 @@ function field(label, name, value, type, extra) {
   if (type === 'textarea') return `<label class="field"><span>${esc(label)}</span><textarea name="${name}" ${extra || ''}>${esc(value)}</textarea></label>`;
   return `<label class="field"><span>${esc(label)}</span><input type="${type}" name="${name}" value="${esc(value)}" ${extra || ''}></label>`;
 }
+/** Multi-line boxes (.grow) grow to fit their text so long pasted descriptions are easy to edit. */
+function autoGrow(el) { el.style.height = 'auto'; el.style.height = (el.scrollHeight + 2) + 'px'; }
+document.addEventListener('input', (e) => { if (e.target.matches && e.target.matches('textarea.grow')) autoGrow(e.target); });
+const growObserver = new MutationObserver(() => { $$('textarea.grow:not([data-grown])').forEach((t) => { t.dataset.grown = '1'; requestAnimationFrame(() => autoGrow(t)); }); });
+growObserver.observe(document.body, { childList: true, subtree: true });
 function formData(root) {
   const o = {};
   $$('input[name],textarea[name],select[name]', root).forEach((el) => { o[el.name] = el.type === 'checkbox' ? el.checked : el.value.trim(); });
@@ -780,8 +785,8 @@ function drawLines(focusLast) {
   box.innerHTML = ed.lines.map((l, i) => `
     <div class="line-card" data-i="${i}">
       <div class="line-head"><b>Line ${i + 1}${l.code ? ' · ' + esc(l.code) : ''}</b><button class="icon-btn" data-del="${i}" aria-label="Remove line">${ICON.trash}</button></div>
-      <label class="field"><span>Description</span><input type="text" data-f="desc" value="${esc(l.desc)}"></label>
-      <label class="field"><span>Details (optional)</span><input type="text" data-f="note" value="${esc(l.note)}"></label>
+      <label class="field"><span>Description</span><textarea class="grow" rows="1" data-f="desc">${esc(l.desc)}</textarea></label>
+      <label class="field"><span>Details (optional)</span><textarea class="grow" rows="1" data-f="note">${esc(l.note)}</textarea></label>
       <div class="grid3">
         <label class="field"><span>Qty${l.unit && l.unit !== 'each' ? ' (' + esc(l.unit) + ')' : ''}</span><input type="text" inputmode="decimal" data-f="qty" value="${esc(Core.qtyText(l.qty))}"></label>
         <label class="field"><span>Price</span><input type="text" inputmode="decimal" data-f="price" value="${(l.price / 100).toFixed(2)}"></label>
@@ -791,7 +796,7 @@ function drawLines(focusLast) {
     </div>`).join('');
   $$('.line-card', box).forEach((card) => {
     const l = ed.lines[+card.dataset.i];
-    $$('input[data-f]', card).forEach((inp) => {
+    $$('input[data-f],textarea[data-f]', card).forEach((inp) => {
       inp.addEventListener('input', () => {
         const f = inp.dataset.f;
         if (f === 'price') l.price = Core.toCents(inp.value);
@@ -809,7 +814,7 @@ function drawLines(focusLast) {
       drawLines(false);
     };
   });
-  if (focusLast) { const last = $$('.line-card', box).pop(); if (last) { last.scrollIntoView({ block: 'center' }); $('input[data-f=desc]', last).focus(); } }
+  if (focusLast) { const last = $$('.line-card', box).pop(); if (last) { last.scrollIntoView({ block: 'center' }); $('[data-f=desc]', last).focus(); } }
   drawTotals();
 }
 function drawTotals() {
@@ -1166,8 +1171,8 @@ function drawQLines(focus) {
     n++;
     return `<div class="line-card ${l.optional ? 'is-optional' : ''}" data-i="${i}">
       <div class="line-head"><b>Line ${n}${l.code ? ' · ' + esc(l.code) : ''}</b>${moveBtns(i)}</div>
-      <label class="field"><span>Description</span><input type="text" data-f="desc" value="${esc(l.desc)}"></label>
-      <label class="field"><span>Details (optional)</span><input type="text" data-f="note" value="${esc(l.note)}"></label>
+      <label class="field"><span>Description</span><textarea class="grow" rows="1" data-f="desc">${esc(l.desc)}</textarea></label>
+      <label class="field"><span>Details (optional)</span><textarea class="grow" rows="1" data-f="note">${esc(l.note)}</textarea></label>
       <div class="grid3">
         <label class="field"><span>Qty${l.unit && l.unit !== 'each' ? ' (' + esc(l.unit) + ')' : ''}</span><input type="text" inputmode="decimal" data-f="qty" value="${esc(Core.qtyText(l.qty))}"></label>
         <label class="field"><span>Price</span><input type="text" inputmode="decimal" data-f="price" value="${(l.price / 100).toFixed(2)}"></label>
@@ -1180,7 +1185,7 @@ function drawQLines(focus) {
   $$('[data-i]', box).forEach((card) => {
     const i = +card.dataset.i;
     const l = qed.lines[i];
-    $$('input[data-f]', card).forEach((inp) => {
+    $$('input[data-f],textarea[data-f]', card).forEach((inp) => {
       const f = inp.dataset.f;
       inp.addEventListener(inp.type === 'checkbox' ? 'change' : 'input', () => {
         if (f === 'price') l.price = Core.toCents(inp.value);
@@ -1206,7 +1211,7 @@ function drawQLines(focus) {
   });
   if (focus === 'last') {
     const last = $$('[data-i]', box).pop();
-    if (last) { last.scrollIntoView({ block: 'center' }); const inp = $('input[data-f=title],input[data-f=desc]', last); if (inp) inp.focus(); }
+    if (last) { last.scrollIntoView({ block: 'center' }); const inp = $('input[data-f=title],[data-f=desc]', last); if (inp) inp.focus(); }
   }
   drawQTotals();
 }

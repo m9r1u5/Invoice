@@ -251,3 +251,6 @@ input[readonly] { opacity: .75; }
   .brand span { display: none; }
   .grid4 { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* Multi-line Description / Details boxes on invoice and quote lines */
+textarea.grow { min-height: 48px; resize: none; overflow: hidden; line-height: 1.4; }
