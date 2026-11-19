@@ -3,7 +3,7 @@
    Invoices PWA — offline invoicing (IndexedDB + pdf-lib + pdf.js)
    To publish an update: bump APP_VERSION here AND VERSION in sw.js.
    ===================================================================== */
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.1.2';
 
 /* ---------------------------------------------------------------------
    CORE: pure logic (money, VAT, dates, numbering, PDF text extraction)
@@ -433,6 +433,7 @@ function openSheet(title, html, opts) {
   $('#sheetBody').innerHTML = html;
   $('#sheetBody').scrollTop = 0;
   $('.sheet').classList.toggle('full', !!(opts && opts.full));
+  $('#sheetBody').classList.toggle('preview', !!(opts && opts.preview));
   $('#sheet').hidden = false;
   sheetOnClose = (opts && opts.onClose) || null;
   return $('#sheetBody');
@@ -440,6 +441,7 @@ function openSheet(title, html, opts) {
 function closeSheet() {
   $('#sheet').hidden = true;
   $('#sheetBody').innerHTML = '';
+  $('#sheetBody').classList.remove('preview');
   const f = sheetOnClose; sheetOnClose = null;
   if (f) f();
 }
@@ -1493,12 +1495,78 @@ async function renderPdfPages(bytes, scale) {
   return canvases;
 }
 async function previewPdf(bytes, title) {
-  const body = openSheet(title, '<div class="empty">Loading preview…</div>', { full: true });
+  const body = openSheet(title, '<div class="empty">Loading preview…</div>', { full: true, preview: true });
   const width = Math.min(window.innerWidth, 720);
-  const scale = Math.min(3, Math.max(1.2, (width / 595) * (window.devicePixelRatio || 1)));
+  // render at ~2x the screen's resolution so text stays sharp when zoomed in (capped to keep memory sane)
+  const scale = Math.min(4.5, Math.max(2, (width / 595) * (window.devicePixelRatio || 1) * 2));
   const canvases = await renderPdfPages(bytes, scale);
-  body.innerHTML = '<div class="pdf-pages"></div>';
-  canvases.forEach((c) => $('.pdf-pages', body).appendChild(c));
+  if (!body.isConnected || $('#sheet').hidden) return;
+  body.innerHTML = `
+    <div class="zoom-bar">
+      <button class="btn sm" id="zOut" aria-label="Zoom out">−</button>
+      <span id="zPct">100%</span>
+      <button class="btn sm" id="zIn" aria-label="Zoom in">+</button>
+      <button class="btn sm" id="zFit">Fit</button>
+      <span class="muted small zoom-hint">Pinch or double-tap to zoom</span>
+    </div>
+    <div class="pdf-zoom" id="pz"><div class="pdf-pages" id="pp"></div></div>`;
+  const pz = $('#pz', body), pp = $('#pp', body);
+  canvases.forEach((c) => pp.appendChild(c));
+  attachZoom(pz, pp, $('#zPct', body), { zIn: $('#zIn', body), zOut: $('#zOut', body), zFit: $('#zFit', body) });
+}
+/** Pinch / double-tap / button zoom for the PDF preview (works the same in the browser and the APK). */
+function attachZoom(pz, pp, label, btn) {
+  const MIN = 1, MAX = 5;
+  let zoom = 1;
+  const setZoom = (z, cx, cy) => {
+    z = Math.min(MAX, Math.max(MIN, z));
+    if (cx == null) { cx = pz.clientWidth / 2; cy = pz.clientHeight / 2; }
+    // keep the point under the fingers / tap in the same place on screen
+    const px = (pz.scrollLeft + cx) / zoom, py = (pz.scrollTop + cy) / zoom;
+    zoom = z;
+    pp.style.width = (z * 100) + '%';
+    pz.scrollLeft = px * z - cx;
+    pz.scrollTop = py * z - cy;
+    label.textContent = Math.round(z * 100) + '%';
+  };
+  const rel = (t) => { const r = pz.getBoundingClientRect(); return [t.clientX - r.left, t.clientY - r.top]; };
+  btn.zIn.onclick = () => setZoom(zoom * 1.5);
+  btn.zOut.onclick = () => setZoom(zoom / 1.5);
+  btn.zFit.onclick = () => setZoom(1);
+  let pinch = null, lastTap = 0, lastXY = null, moved = false;
+  pz.addEventListener('touchstart', (e) => {
+    moved = false;
+    if (e.touches.length === 2) {
+      const [a, b] = e.touches;
+      const [ax, ay] = rel(a), [bx, by] = rel(b);
+      pinch = { d: Math.hypot(ax - bx, ay - by) || 1, z: zoom };
+      e.preventDefault();
+    }
+  }, { passive: false });
+  pz.addEventListener('touchmove', (e) => {
+    moved = true;
+    if (pinch && e.touches.length === 2) {
+      const [a, b] = e.touches;
+      const [ax, ay] = rel(a), [bx, by] = rel(b);
+      setZoom(pinch.z * Math.hypot(ax - bx, ay - by) / pinch.d, (ax + bx) / 2, (ay + by) / 2);
+      e.preventDefault();
+    }
+  }, { passive: false });
+  pz.addEventListener('touchend', (e) => {
+    if (pinch) { if (e.touches.length < 2) pinch = null; lastTap = 0; return; }
+    if (moved || e.changedTouches.length !== 1) { lastTap = 0; return; }
+    const xy = rel(e.changedTouches[0]);
+    const now = Date.now();
+    if (now - lastTap < 320 && lastXY && Math.hypot(xy[0] - lastXY[0], xy[1] - lastXY[1]) < 40) {
+      setZoom(zoom > 1.2 ? 1 : 2.5, xy[0], xy[1]);
+      lastTap = 0;
+      e.preventDefault();
+    } else { lastTap = now; lastXY = xy; }
+  }, { passive: false });
+  // desktop: ctrl + mouse wheel, and double-click
+  pz.addEventListener('wheel', (e) => { if (!e.ctrlKey) return; e.preventDefault(); const [x, y] = rel(e); setZoom(zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15), x, y); }, { passive: false });
+  pz.addEventListener('dblclick', (e) => { const [x, y] = rel(e); setZoom(zoom > 1.2 ? 1 : 2.5, x, y); });
+  pz._setZoom = setZoom; pz._getZoom = () => zoom; // for tests
 }
 async function printPdf(bytes, name) {
   if (NATIVE) { NATIVE.printPdf(bufToB64(bytes), (name || 'Invoice').replace(/\.pdf$/i, '')); return; }
